@@ -32,3 +32,4 @@ Located in: `oxide/config/WagonResourceMultiplier.json`
     "Wagon Fuel Multiplier": 1.0
   }
 }
+
