@@ -5,175 +5,110 @@ using Oxide.Core.Libraries.Covalence;
 
 namespace Oxide.Plugins
 {
-    [Info("TrainWagonLootMultiplier", "Codex", "1.0")]
-    [Description("Multiplies loot in ore wagons and fuel crates using prefab matching and proximity+contents.")]
-    public class TrainWagonLootMultiplier : RustPlugin
+    [Info("WagonResourceMultiplier", "Codex", "1.0.2")]
+    [Description("Multiplies ore and fuel amounts in train wagons based on config multipliers without modifying Rust's natural loot.")]
+    public class WagonResourceMultiplier : RustPlugin
     {
-        private Dictionary<string, float> ConfigMultipliers;
         private Dictionary<string, float> PrefabMultiplierMap;
-
-        private readonly Dictionary<string, string> PrefabMap = new()
+        private readonly Dictionary<string, string> ConfigToPrefab = new()
         {
             { "Wagon Ore Multiplier", "assets/content/vehicles/trains/wagons/trainwagonunloadable.entity.prefab" },
             { "Wagon Fuel Multiplier", "assets/content/vehicles/trains/wagons/trainwagonunloadablefuel.entity.prefab" }
         };
 
-        private readonly HashSet<ulong> ProcessedWagons = new();
-        private readonly HashSet<ulong> ProcessedContainers = new();
-        private readonly List<BaseEntity> ActiveFuelWagons = new();
-
         private bool EnableLogging = false;
-        private const string LogFilePrefix = "TrainWagonLootMultiplier";
+        private bool ClampToStackLimit = true;
+        private const string LogFilePrefix = "WagonResourceMultiplier";
+
+        private HashSet<ulong> ProcessedWagons = new HashSet<ulong>();
 
         protected override void LoadDefaultConfig()
         {
             Config["EnableLogging"] = false;
+            Config["ClampToStackLimit"] = true;
             Config["WagonMultipliers"] = new Dictionary<string, object>
             {
-                { "Wagon Ore Multiplier", 2.0 },
-                { "Wagon Fuel Multiplier", 3.5 }
+                { "Wagon Ore Multiplier", 1.0 },
+                { "Wagon Fuel Multiplier", 1.0 }
             };
         }
 
         void OnServerInitialized()
         {
             EnableLogging = GetConfig("EnableLogging", false);
+            ClampToStackLimit = GetConfig("ClampToStackLimit", true);
             LoadMultipliers();
         }
 
         private void LoadMultipliers()
         {
             PrefabMultiplierMap = new();
-            ConfigMultipliers = new();
 
-            var raw = Config["WagonMultipliers"] as Dictionary<string, object>;
-            if (raw == null)
+            var multipliers = Config["WagonMultipliers"] as Dictionary<string, object>;
+            if (multipliers == null)
             {
-                PrintError("Invalid config format for WagonMultipliers.");
+                PrintError("Invalid config format.");
                 return;
             }
 
-            foreach (var entry in raw)
+            foreach (var entry in ConfigToPrefab)
             {
-                string key = entry.Key.Trim();
-                if (!PrefabMap.ContainsKey(key)) continue;
+                string configKey = entry.Key;
+                string prefab = entry.Value.ToLower();
 
-                string prefab = PrefabMap[key].ToLower();
-                if (float.TryParse(entry.Value.ToString(), out float multiplier))
+                if (multipliers.TryGetValue(configKey, out object raw) &&
+                    float.TryParse(raw.ToString(), out float mult))
                 {
-                    PrefabMultiplierMap[prefab] = multiplier;
-                    ConfigMultipliers[key] = multiplier;
+                    PrefabMultiplierMap[prefab] = mult;
                 }
             }
-
-            Config["WagonMultipliers"] = ConfigMultipliers;
-            SaveConfig();
         }
 
         void OnEntitySpawned(BaseNetworkable entity)
         {
             if (entity == null || entity.PrefabName == null) return;
+
             string prefab = entity.PrefabName.ToLower();
+            if (!PrefabMultiplierMap.TryGetValue(prefab, out float multiplier)) return;
 
-            if (prefab == "assets/content/vehicles/trains/wagons/trainwagonunloadablefuel.entity.prefab")
+            if (entity is not BaseEntity baseEntity || baseEntity.net?.ID == null) return;
+            if (ProcessedWagons.Contains(baseEntity.net.ID.Value)) return;
+
+            ProcessedWagons.Add(baseEntity.net.ID.Value);
+
+            timer.Once(5f, () =>
             {
-                var baseEntity = entity as BaseEntity;
-                if (baseEntity != null && !ActiveFuelWagons.Contains(baseEntity))
-                {
-                    ActiveFuelWagons.Add(baseEntity);
-                    if (EnableLogging)
-                        LogToFile(LogFilePrefix, $"[DEBUG] Tracked fuel wagon at {baseEntity.transform.position}", this);
-                }
+                if (baseEntity == null || baseEntity.IsDestroyed) return;
+
+                var containers = baseEntity.GetComponentsInChildren<StorageContainer>(true);
+                foreach (var container in containers)
+                    MultiplyExistingLoot(container, multiplier, baseEntity.ShortPrefabName);
+            });
+        }
+
+        private void MultiplyExistingLoot(StorageContainer container, float multiplier, string wagonName)
+        {
+            if (container?.inventory?.itemList == null || container.inventory.itemList.Count == 0)
                 return;
-            }
-
-            if (PrefabMultiplierMap.TryGetValue(prefab, out float multiplier))
-            {
-                var baseEntity = entity as BaseEntity;
-                if (baseEntity == null) return;
-
-                timer.Once(5f, () => MultiplyOreWagon(baseEntity, multiplier));
-            }
-
-            if (entity is StorageContainer container)
-            {
-                timer.Once(3f, () => TryMatchFuelCrate(container));
-            }
-        }
-
-        private void MultiplyOreWagon(BaseEntity wagon, float multiplier)
-        {
-            if (wagon.net?.ID == null || ProcessedWagons.Contains(wagon.net.ID.Value)) return;
-            ProcessedWagons.Add(wagon.net.ID.Value);
-
-            var containers = wagon.GetComponentsInChildren<StorageContainer>(true);
-            foreach (var container in containers)
-            {
-                MultiplyItems(container, multiplier, wagon.ShortPrefabName);
-            }
-        }
-
-        private void TryMatchFuelCrate(StorageContainer container)
-        {
-            if (container == null || container.net?.ID == null || ProcessedContainers.Contains(container.net.ID.Value)) return;
-
-            bool containsFuel = false;
-            foreach (var item in container.inventory?.itemList ?? new List<Item>())
-            {
-                if (item.info.shortname == "lowgradefuel")
-                {
-                    containsFuel = true;
-                    break;
-                }
-            }
-
-            if (!containsFuel) return;
-
-            BaseEntity closestWagon = null;
-            float closestDist = float.MaxValue;
-
-            foreach (var wagon in ActiveFuelWagons)
-            {
-                if (wagon == null || wagon.IsDestroyed) continue;
-
-                float dist = Vector3.Distance(container.transform.position, wagon.transform.position);
-                if (dist < 30f && dist < closestDist)
-                {
-                    closestWagon = wagon;
-                    closestDist = dist;
-                }
-            }
-
-            if (closestWagon == null)
-            {
-                if (EnableLogging)
-                    LogToFile(LogFilePrefix, $"[DEBUG] Fuel crate found but no wagon matched. Pos: {container.transform.position}", this);
-                return;
-            }
-
-            float multiplier = PrefabMultiplierMap["assets/content/vehicles/trains/wagons/trainwagonunloadablefuel.entity.prefab"];
-            ProcessedContainers.Add(container.net.ID.Value);
-            if (EnableLogging)
-                LogToFile(LogFilePrefix, $"[DEBUG] Matched fuel crate to wagon at {closestWagon.transform.position} (dist: {closestDist})", this);
-
-            MultiplyItems(container, multiplier, closestWagon.ShortPrefabName);
-        }
-
-        private void MultiplyItems(StorageContainer container, float multiplier, string wagonName)
-        {
-            if (container?.inventory?.itemList == null) return;
 
             foreach (var item in container.inventory.itemList)
             {
-                object hook = Interface.CallHook("OnMaxStackable", item);
-                int maxStack = (hook is int) ? (int)hook : item.info.stackable;
-
                 int original = item.amount;
-                item.amount = Mathf.Min(Mathf.CeilToInt(original * multiplier), maxStack);
+                int multiplied = Mathf.CeilToInt(original * multiplier);
+
+                object hook = Interface.CallHook("OnMaxStackable", item);
+                int maxStack = (hook is int hookValue && hookValue > 0)
+                    ? hookValue
+                    : item.info.stackable;
+
+                item.amount = ClampToStackLimit
+                    ? Mathf.Min(multiplied, maxStack)
+                    : multiplied;
+
                 item.MarkDirty();
 
                 if (EnableLogging)
-                    LogToFile(LogFilePrefix, $"[WAGON] {wagonName} | Item: {item.info.shortname} | {original} → {item.amount}", this);
+                    LogToFile(LogFilePrefix, $"[WAGON] {wagonName} | Item: {item.info.shortname} | Vanilla: {original} → {item.amount} (x{multiplier})", this);
             }
 
             container.inventory.MarkDirty();
